@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # DeepProbe
 
 DeepProbe is a Python GUI network mapping tool for authorized cybersecurity assessments. It is designed to feel easier than command-line scanners while adding detailed evidence, local AI-style triage, ethical-hacking themed visuals, and exportable reporting.
@@ -157,3 +158,6 @@ Only scan systems you own or have explicit permission to assess. Start with `qui
 ## Limitations
 
 DeepProbe does not try to replace Nmap's raw packet engine, NSE scripts, or privileged SYN scanning. It focuses on an advanced GUI, TCP-connect scanning, lightweight UDP checks, service evidence, risk triage, per-port security explanations, and reporting in pure Python.
+=======
+# Deepprobe-
+>>>>>>> dd333834cbb7db65be5a48356ea0d8241c6d2504
