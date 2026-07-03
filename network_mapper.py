@@ -366,6 +366,9 @@ class PortFinding:
     risk: str = ""
     evidence: str = ""
     severity: str = "info"
+    confidence: int = 0
+    connect_ms: float = 0.0
+    probe_attempts: int = 1
 
 
 @dataclass
@@ -385,6 +388,7 @@ class HostFinding:
     trace: List[str] = field(default_factory=list)
     ttl_hint: str = ""
     intelligence: str = ""
+    scan_notes: List[str] = field(default_factory=list)
 
     @property
     def risk_score(self) -> int:
@@ -476,14 +480,37 @@ def get_port_attack_profile(item):
     }
 
 
+def port_confidence_label(item):
+    confidence = int(port_value(item, "confidence", 0) or 0)
+    if confidence >= 90:
+        return "high"
+    if confidence >= 75:
+        return "medium"
+    if confidence > 0:
+        return "limited"
+    return "unknown"
+
+
 def format_port_attack_analysis(item):
     port = port_value(item, "port", 0)
+    protocol = port_value(item, "protocol", "tcp")
     profile = get_port_attack_profile(item)
+    confidence = port_value(item, "confidence", 0)
+    connect_ms = float(port_value(item, "connect_ms", 0.0) or 0.0)
+    attempts = port_value(item, "probe_attempts", 1)
     recommendation = PORT_RECOMMENDATIONS.get(
         port,
         "Validate business need, patch level, authentication, logging, and source-network restrictions.",
     )
+    evidence_line = (
+        f"Scan evidence: {protocol.upper()} response confidence is {port_confidence_label(item)} "
+        f"({confidence}%) after {attempts} probe attempt(s)"
+    )
+    if connect_ms:
+        evidence_line += f"; connect time {connect_ms:.0f} ms"
+    evidence_line += "."
     return [
+        evidence_line,
         f"Weakness: {profile['weakness']}",
         f"Possible attack: {profile['attack']}",
         f"Impact: {profile['impact']}",
@@ -491,21 +518,28 @@ def format_port_attack_analysis(item):
     ]
 
 
-def analyze_host(ip, hostname, tcp_ports, udp_findings, ttl_hint):
+def analyze_host(ip, hostname, tcp_ports, udp_findings, ttl_hint, scan_notes=None):
     all_ports = tcp_ports + udp_findings
     port_numbers = {item.port for item in all_ports}
     fingerprints = []
     findings = []
     recommendations = []
+    scan_notes = scan_notes or []
 
     if hostname:
         fingerprints.append(f"Reverse DNS resolved to {hostname}.")
     if ttl_hint:
         fingerprints.append(ttl_hint + ".")
+    fingerprints.extend(scan_notes[:4])
     for item in all_ports:
         fingerprints.append(f"{item.protocol.upper()} {item.port}/{item.service}: {describe_service(item.port, item.service, item.description)}")
         if item.evidence:
             fingerprints.append(f"{item.protocol.upper()} {item.port}: {item.evidence}.")
+        if item.confidence:
+            fingerprints.append(
+                f"{item.protocol.upper()} {item.port}: {item.confidence}% confidence, "
+                f"{item.connect_ms:.0f} ms connect time, {item.probe_attempts} attempt(s)."
+            )
         if item.banner:
             fingerprints.append(f"{item.protocol.upper()} {item.port} banner: {item.banner[:140]}.")
         if item.port in PORT_RECOMMENDATIONS:
@@ -551,10 +585,23 @@ def analyze_host(ip, hostname, tcp_ports, udp_findings, ttl_hint):
         recommendations.append("Confirm host firewall policy and rerun with a broader profile if needed.")
     recommendations.extend(BASELINE_RECOMMENDATIONS)
 
+    highest_confidence = max((item.confidence for item in all_ports), default=0)
+    lowest_confidence = min((item.confidence for item in all_ports if item.confidence), default=0)
+    confidence_summary = "No open service confidence could be calculated."
+    if all_ports:
+        confidence_summary = (
+            f"Open-service confidence ranges from {lowest_confidence}% to {highest_confidence}%; "
+            "lower-confidence services should be rechecked with precise mode or a longer timeout."
+        )
+    exposed = ", ".join(f"{item.port}/{item.protocol}" for item in sorted(all_ports, key=lambda value: (value.protocol, value.port))[:8])
+    if len(all_ports) > 8:
+        exposed += ", ..."
     intelligence = (
-        f"DeepProbe AI Intel: {ip} has {len(tcp_ports)} TCP and {len(udp_findings)} UDP finding(s). "
+        f"DeepProbe AI Intel: {ip} has {len(tcp_ports)} confirmed TCP and {len(udp_findings)} UDP finding(s). "
         f"Priority signals: {high_count} high/critical and {medium_count} medium exposure(s). "
         f"Most likely role: {infer_role(port_numbers)}. "
+        f"Exposed services: {exposed or 'none from the selected profile'}. "
+        f"{confidence_summary} "
         f"Recommended next action: {recommendations[0] if recommendations else 'Validate asset ownership and patch state.'}"
     )
     return fingerprints[:12], dedupe(findings), dedupe(recommendations), intelligence
@@ -589,8 +636,21 @@ class NetworkScanner:
         self.progress_queue = progress_queue
         self.stop_event = stop_event
 
-    def scan(self, targets, ports, scan_dead_hosts, timeout, workers, udp_enabled=False, trace_enabled=False, banner_enabled=True):
+    def scan(
+        self,
+        targets,
+        ports,
+        scan_dead_hosts,
+        timeout,
+        workers,
+        udp_enabled=False,
+        trace_enabled=False,
+        banner_enabled=True,
+        accuracy_mode="balanced",
+    ):
         addresses = self._expand_targets(targets)
+        if not addresses:
+            raise ValueError("No valid targets were found. Enter an IP, hostname, CIDR range, or comma-separated target list.")
         total = max(len(addresses), 1)
         self._log(f"Expanded target set to {len(addresses)} address(es).")
         results = []
@@ -606,6 +666,7 @@ class NetworkScanner:
                     udp_enabled,
                     trace_enabled,
                     banner_enabled,
+                    accuracy_mode,
                 ): ip
                 for ip in addresses
             }
@@ -615,9 +676,10 @@ class NetworkScanner:
                 ip = futures[future]
                 try:
                     host = future.result()
-                    if host.alive or host.ports:
-                        results.append(host)
-                        self.progress_queue.put(("host", host))
+                    results.append(host)
+                    self.progress_queue.put(("host", host))
+                    if not host.alive and not host.ports and not host.udp_findings:
+                        self._log(f"{ip}: scanned, but no selected TCP/UDP service responded.")
                 except Exception as exc:
                     self._log(f"{ip}: {exc}")
                 self.progress_queue.put(("progress", done_count, total))
@@ -651,7 +713,7 @@ class NetworkScanner:
             raise ValueError("Target range is too large for this desktop scanner. Use /20 or smaller.")
         return unique
 
-    def _scan_host(self, ip, ports, scan_dead_hosts, timeout, udp_enabled, trace_enabled, banner_enabled):
+    def _scan_host(self, ip, ports, scan_dead_hosts, timeout, udp_enabled, trace_enabled, banner_enabled, accuracy_mode):
         if self.stop_event.is_set():
             raise ScanCancelled()
 
@@ -662,10 +724,15 @@ class NetworkScanner:
         hostname = self._reverse_dns(ip)
         mac = lookup_arp_mac(ip)
         open_ports = []
+        scan_notes = [
+            f"Scanner platform: {platform.system() or sys.platform}; TCP connect mode; timeout {timeout:.1f}s; accuracy {accuracy_mode}."
+        ]
+        if not alive and scan_dead_hosts:
+            scan_notes.append("ICMP did not confirm the host, so TCP discovery continued because that option is enabled.")
         for port in ports:
             if self.stop_event.is_set():
                 raise ScanCancelled()
-            finding = self._probe_port(ip, port, timeout, banner_enabled)
+            finding = self._probe_port(ip, port, timeout, banner_enabled, accuracy_mode)
             if finding:
                 open_ports.append(finding)
 
@@ -677,7 +744,14 @@ class NetworkScanner:
                     udp_findings.append(finding)
 
         trace = self._trace_route(ip, timeout) if trace_enabled and (alive or open_ports) else []
-        fingerprints, findings, recommendations, intelligence = analyze_host(ip, hostname, open_ports, udp_findings, ttl_hint)
+        fingerprints, findings, recommendations, intelligence = analyze_host(
+            ip,
+            hostname,
+            open_ports,
+            udp_findings,
+            ttl_hint,
+            scan_notes,
+        )
 
         return HostFinding(
             ip=ip,
@@ -694,12 +768,15 @@ class NetworkScanner:
             trace=trace,
             ttl_hint=ttl_hint,
             intelligence=intelligence,
+            scan_notes=scan_notes,
         )
 
     def _ping(self, ip, timeout):
         system = platform.system().lower()
         if system == "windows":
             cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+        elif system == "darwin":
+            cmd = ["ping", "-c", "1", "-W", str(int(timeout * 1000)), ip]
         else:
             cmd = ["ping", "-c", "1", "-W", str(max(int(timeout), 1)), ip]
         started = time.perf_counter()
@@ -729,35 +806,100 @@ class NetworkScanner:
             return "TTL suggests Windows-class host"
         return "TTL suggests network device or uncommon stack"
 
-    def _probe_port(self, ip, port, timeout, banner_enabled=True):
-        try:
-            with socket.create_connection((ip, port), timeout=timeout) as sock:
-                sock.settimeout(min(timeout, 1.0))
-                service, description = COMMON_PORTS.get(port, ("unknown", "Unidentified TCP service"))
-                banner = self._grab_banner(sock, port) if banner_enabled else ""
-                extra_evidence = []
-                if banner_enabled and port in WEB_PORTS:
-                    web_info = self._probe_http(ip, port, timeout, port in TLS_PORTS)
-                    if web_info:
-                        extra_evidence.append(web_info)
-                if banner_enabled and port in TLS_PORTS:
-                    tls_info = self._probe_tls(ip, port, timeout)
-                    if tls_info:
-                        extra_evidence.append(tls_info)
-                risk = RISKY_PORTS.get(port, "")
-                severity = classify_port_severity(port, banner, "tcp")
-                return PortFinding(
-                    port=port,
-                    service=service,
-                    description=description,
-                    protocol="tcp",
-                    banner=banner,
-                    risk=risk,
-                    evidence=" | ".join(extra_evidence),
-                    severity=severity,
-                )
-        except (OSError, socket.timeout):
-            return None
+    def _probe_port(self, ip, port, timeout, banner_enabled=True, accuracy_mode="balanced"):
+        attempts_by_mode = {"fast": 1, "balanced": 2, "precise": 3}
+        timeout_factor = {"fast": 0.85, "balanced": 1.0, "precise": 1.4}.get(accuracy_mode, 1.0)
+        attempts = attempts_by_mode.get(accuracy_mode, 2)
+        connect_timeout = max(0.25, timeout * timeout_factor)
+
+        for attempt in range(attempts):
+            if self.stop_event.is_set():
+                raise ScanCancelled()
+            try:
+                started = time.perf_counter()
+                with socket.create_connection((ip, port), timeout=connect_timeout) as sock:
+                    connect_ms = (time.perf_counter() - started) * 1000
+                    sock.settimeout(max(0.4, min(connect_timeout, 1.5)))
+                    service, description = self._service_metadata(port, "tcp")
+                    banner = self._grab_banner(sock, port) if banner_enabled else ""
+                    verified = self._verify_open_port(ip, port, connect_timeout, accuracy_mode)
+                    probe_attempts = attempt + 1 + verified
+                    confidence = self._open_port_confidence(accuracy_mode, verified, bool(banner))
+                    extra_evidence = [
+                        f"TCP connect confirmed",
+                        f"{confidence}% confidence",
+                        f"{probe_attempts} total probe attempt(s)",
+                    ]
+                    if banner_enabled and port in WEB_PORTS:
+                        web_info = self._probe_http(ip, port, connect_timeout, port in TLS_PORTS)
+                        if web_info:
+                            extra_evidence.append(web_info)
+                            confidence = min(99, confidence + 4)
+                    if banner_enabled and port in TLS_PORTS:
+                        tls_info = self._probe_tls(ip, port, connect_timeout)
+                        if tls_info:
+                            extra_evidence.append(tls_info)
+                            confidence = min(99, confidence + 4)
+                    risk = RISKY_PORTS.get(port, "")
+                    severity = classify_port_severity(port, banner, "tcp")
+                    return PortFinding(
+                        port=port,
+                        service=service,
+                        description=description,
+                        protocol="tcp",
+                        banner=banner,
+                        risk=risk,
+                        evidence=" | ".join(extra_evidence),
+                        severity=severity,
+                        confidence=confidence,
+                        connect_ms=connect_ms,
+                        probe_attempts=probe_attempts,
+                    )
+            except ConnectionRefusedError:
+                return None
+            except TimeoutError as exc:
+                pass
+            except OSError as exc:
+                if getattr(exc, "winerror", None) in {10061, 10049, 10051, 10065}:
+                    return None
+                if getattr(exc, "errno", None) in {111, 113, 101, 99}:
+                    return None
+            except socket.timeout as exc:
+                pass
+            if attempt + 1 < attempts:
+                time.sleep(0.03 * (attempt + 1))
+        return None
+
+    def _verify_open_port(self, ip, port, timeout, accuracy_mode):
+        checks_by_mode = {"fast": 0, "balanced": 1, "precise": 2}
+        verified = 0
+        for check in range(checks_by_mode.get(accuracy_mode, 1)):
+            if self.stop_event.is_set():
+                raise ScanCancelled()
+            try:
+                with socket.create_connection((ip, port), timeout=max(timeout * 0.8, 0.25)):
+                    verified += 1
+            except (OSError, socket.timeout, TimeoutError):
+                break
+            time.sleep(0.02 * (check + 1))
+        return verified
+
+    def _open_port_confidence(self, accuracy_mode, verified, has_banner):
+        base = {"fast": 82, "balanced": 88, "precise": 90}.get(accuracy_mode, 88)
+        confidence = base + (verified * 4)
+        if has_banner:
+            confidence += 5
+        return min(confidence, 99)
+
+    def _service_metadata(self, port, protocol):
+        service, description = COMMON_PORTS.get(port, ("unknown", f"Unidentified {protocol.upper()} service"))
+        if service == "unknown":
+            try:
+                service = socket.getservbyport(port, protocol)
+                description = f"{service.upper()} service"
+            except OSError:
+                pass
+        return service, description
 
     def _probe_udp(self, ip, port, timeout):
         payload = UDP_CHECK_PORTS.get(port, b"")
@@ -766,7 +908,7 @@ class NetworkScanner:
                 sock.settimeout(timeout)
                 sock.sendto(payload, (ip, port))
                 data, _address = sock.recvfrom(256)
-                service, description = COMMON_PORTS.get(port, ("unknown", "UDP service"))
+                service, description = self._service_metadata(port, "udp")
                 return PortFinding(
                     port=port,
                     service=service,
@@ -776,15 +918,17 @@ class NetworkScanner:
                     risk=RISKY_PORTS.get(port, ""),
                     evidence="UDP response received",
                     severity=classify_port_severity(port, "", "udp"),
+                    confidence=78,
+                    probe_attempts=1,
                 )
         except (OSError, socket.timeout):
             return None
 
     def _grab_banner(self, sock, port):
         probes = {
-            80: b"HEAD / HTTP/1.0\r\n\r\n",
-            8080: b"HEAD / HTTP/1.0\r\n\r\n",
-            8000: b"HEAD / HTTP/1.0\r\n\r\n",
+            80: b"HEAD / HTTP/1.1\r\nHost: probe.local\r\nUser-Agent: DeepProbe\r\nConnection: close\r\n\r\n",
+            8080: b"HEAD / HTTP/1.1\r\nHost: probe.local\r\nUser-Agent: DeepProbe\r\nConnection: close\r\n\r\n",
+            8000: b"HEAD / HTTP/1.1\r\nHost: probe.local\r\nUser-Agent: DeepProbe\r\nConnection: close\r\n\r\n",
             443: b"",
             8443: b"",
             21: b"",
@@ -813,8 +957,18 @@ class NetworkScanner:
                 raw = context.wrap_socket(raw, server_hostname=ip)
             with raw:
                 raw.settimeout(timeout)
-                raw.sendall(b"GET / HTTP/1.0\r\nHost: probe.local\r\nUser-Agent: DeepProbe\r\n\r\n")
-                data = raw.recv(2048).decode("utf-8", errors="replace")
+                request = f"GET / HTTP/1.1\r\nHost: {ip}\r\nUser-Agent: DeepProbe\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+                raw.sendall(request.encode("ascii", errors="ignore"))
+                chunks = []
+                while sum(len(chunk) for chunk in chunks) < 8192:
+                    try:
+                        chunk = raw.recv(2048)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                data = b"".join(chunks).decode("utf-8", errors="replace")
             server = re.search(r"^Server:\s*(.+)$", data, re.IGNORECASE | re.MULTILINE)
             title = re.search(r"<title[^>]*>(.*?)</title>", data, re.IGNORECASE | re.DOTALL)
             parts = [f"{scheme.upper()} responsive"]
@@ -951,10 +1105,10 @@ def parse_ports(raw_value):
 class NetworkMapperApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("DeepProbe // Ethical Network Intelligence")
-        self.geometry("1360x820")
-        self.minsize(1100, 700)
-        self.configure(bg="#071013")
+        self.title("DeepProbe - Enterprise Network Assessment Console")
+        self.geometry("1480x900")
+        self.minsize(1220, 760)
+        self.configure(bg="#0f172a")
 
         self.results = []
         self.scan_thread = None
@@ -970,123 +1124,167 @@ class NetworkMapperApp(tk.Tk):
         self.style = ttk.Style(self)
         if "clam" in self.style.theme_names():
             self.style.theme_use("clam")
-        bg = "#071013"
-        panel = "#0d1b1e"
-        field = "#10262b"
-        text = "#d7ffe8"
-        accent = "#00ff9c"
-        muted = "#8fb9a8"
+        bg = "#0f172a"
+        panel = "#111827"
+        panel_soft = "#182235"
+        header = "#0b1120"
+        field = "#020617"
+        text = "#e5e7eb"
+        accent = "#38bdf8"
+        muted = "#94a3b8"
+        border = "#2b3648"
         self.style.configure(".", background=bg, foreground=text, fieldbackground=field, font=("Segoe UI", 10))
         self.style.configure("TFrame", background=bg)
         self.style.configure("Panel.TFrame", background=panel, relief="flat")
+        self.style.configure("Header.TFrame", background=header, relief="flat")
+        self.style.configure("Surface.TFrame", background=panel_soft, relief="flat")
         self.style.configure("TLabel", background=bg, foreground=text)
+        self.style.configure("Panel.TLabel", background=panel, foreground=text)
+        self.style.configure("Header.TLabel", background=header, foreground=text)
+        self.style.configure("Surface.TLabel", background=panel_soft, foreground=text)
         self.style.configure("Muted.TLabel", background=bg, foreground=muted)
-        self.style.configure("Title.TLabel", background=bg, foreground=accent, font=("Courier New", 30, "bold"))
-        self.style.configure("Glitch.TLabel", background=bg, foreground="#39ff14", font=("Courier New", 11, "bold"))
-        self.style.configure("SubTitle.TLabel", background=bg, foreground=muted, font=("Consolas", 10))
-        self.style.configure("Metric.TLabel", background=bg, foreground=accent, font=("Consolas", 20, "bold"))
-        self.style.configure("TButton", background="#12343a", foreground=text, bordercolor="#1ddf99", focusthickness=1)
-        self.style.map("TButton", background=[("active", "#16505a")], foreground=[("active", "#ffffff")])
+        self.style.configure("PanelMuted.TLabel", background=panel, foreground=muted)
+        self.style.configure("HeaderMuted.TLabel", background=header, foreground=muted)
+        self.style.configure("Title.TLabel", background=header, foreground="#f8fafc", font=("Segoe UI Semibold", 25))
+        self.style.configure("SubTitle.TLabel", background=header, foreground="#cbd5e1", font=("Segoe UI", 10))
+        self.style.configure("Eyebrow.TLabel", background=header, foreground=accent, font=("Segoe UI Semibold", 9))
+        self.style.configure("Section.TLabel", background=panel, foreground="#cbd5e1", font=("Segoe UI Semibold", 10))
+        self.style.configure("BodySection.TLabel", background=bg, foreground="#cbd5e1", font=("Segoe UI Semibold", 11))
+        self.style.configure("Metric.TLabel", background=panel, foreground="#f8fafc", font=("Segoe UI Semibold", 22))
+        self.style.configure("MetricName.TLabel", background=panel, foreground=muted, font=("Segoe UI", 9))
+        self.style.configure("TButton", background="#1f2937", foreground=text, bordercolor=border, focusthickness=1, padding=(12, 8))
+        self.style.map("TButton", background=[("active", "#334155"), ("disabled", "#111827")], foreground=[("active", "#ffffff")])
+        self.style.configure("Accent.TButton", background="#0369a1", foreground="#f8fafc", bordercolor="#0ea5e9")
+        self.style.map("Accent.TButton", background=[("active", "#0284c7")])
+        self.style.configure("Danger.TButton", background="#7f1d1d", foreground="#fee2e2", bordercolor="#991b1b")
+        self.style.map("Danger.TButton", background=[("active", "#991b1b")])
         self.style.configure("TCheckbutton", background=bg, foreground=text)
-        self.style.configure("TEntry", fieldbackground=field, foreground=text, insertcolor=text)
-        self.style.configure("TCombobox", fieldbackground=field, foreground=text, arrowcolor=accent)
-        self.style.configure("Treeview", rowheight=28, background="#08171a", fieldbackground="#08171a", foreground=text)
-        self.style.configure("Treeview.Heading", background="#12343a", foreground=accent, font=("Segoe UI", 10, "bold"))
-        self.style.map("Treeview", background=[("selected", "#145a46")], foreground=[("selected", "#ffffff")])
+        self.style.configure("Panel.TCheckbutton", background=panel, foreground=text)
+        self.style.map("TCheckbutton", background=[("active", bg)], foreground=[("active", "#ffffff")])
+        self.style.map("Panel.TCheckbutton", background=[("active", panel)], foreground=[("active", "#ffffff")])
+        self.style.configure("TEntry", fieldbackground=field, foreground=text, insertcolor=text, bordercolor=border, lightcolor=border, darkcolor=border)
+        self.style.configure("TSpinbox", fieldbackground=field, foreground=text, insertcolor=text, bordercolor=border, arrowcolor=accent)
+        self.style.configure("TCombobox", fieldbackground=field, foreground=text, arrowcolor=accent, bordercolor=border)
+        self.style.configure("Treeview", rowheight=30, background="#0f172a", fieldbackground="#0f172a", foreground=text, bordercolor=border)
+        self.style.configure("Treeview.Heading", background="#182235", foreground="#cbd5e1", font=("Segoe UI Semibold", 10), relief="flat")
+        self.style.map(
+            "Treeview.Heading",
+            background=[("active", "#075985")],
+            foreground=[("active", "#ffffff")],
+            relief=[("active", "flat")],
+        )
+        self.style.map("Treeview", background=[("selected", "#075985")], foreground=[("selected", "#ffffff")])
+        self.style.configure("Horizontal.TProgressbar", background=accent, troughcolor="#111827", bordercolor=border, lightcolor=accent, darkcolor=accent)
 
     def _build_ui(self):
-        main = ttk.Frame(self, padding=12)
+        main = ttk.Frame(self, padding=16)
         main.pack(fill=BOTH, expand=True)
 
-        header = ttk.Frame(main)
-        header.pack(fill=X, pady=(0, 10))
-        brand = ttk.Frame(header)
+        header = ttk.Frame(main, style="Header.TFrame", padding=(18, 16))
+        header.pack(fill=X, pady=(0, 14))
+        brand = ttk.Frame(header, style="Header.TFrame")
         brand.pack(side=LEFT)
-        ttk.Label(brand, text="[ D33PPR0B3 ]", style="Title.TLabel").pack(anchor=W)
-        ttk.Label(brand, text="root@deepprobe:~# ethical_network_intel --authorized", style="Glitch.TLabel").pack(anchor=W)
-        ttk.Label(header, text=f"  // {APP_TAGLINE}", style="SubTitle.TLabel").pack(side=LEFT, padx=(14, 0), pady=(22, 0))
+        ttk.Label(brand, text="AUTHORIZED SECURITY ASSESSMENT", style="Eyebrow.TLabel").pack(anchor=W)
+        ttk.Label(brand, text="DeepProbe", style="Title.TLabel").pack(anchor=W)
+        ttk.Label(brand, text="Enterprise Network Assessment Console", style="SubTitle.TLabel").pack(anchor=W)
+        ttk.Label(header, text=APP_TAGLINE, style="HeaderMuted.TLabel").pack(side=LEFT, padx=(24, 0), pady=(34, 0))
         self.clock_var = tk.StringVar(value=datetime.now().strftime("%H:%M:%S"))
-        ttk.Label(header, textvariable=self.clock_var, style="SubTitle.TLabel").pack(side=RIGHT, pady=(10, 0))
+        clock_box = ttk.Frame(header, style="Header.TFrame")
+        clock_box.pack(side=RIGHT)
+        ttk.Label(clock_box, text="LOCAL TIME", style="Eyebrow.TLabel").pack(anchor="e")
+        ttk.Label(clock_box, textvariable=self.clock_var, style="SubTitle.TLabel").pack(anchor="e")
         self.after(1000, self._tick_clock)
 
-        controls = ttk.Frame(main)
+        controls = ttk.Frame(main, style="Panel.TFrame", padding=14)
         controls.pack(fill=X)
 
-        left = ttk.Frame(controls)
+        left = ttk.Frame(controls, style="Panel.TFrame")
         left.pack(side=LEFT, fill=X, expand=True)
 
-        ttk.Label(left, text="TARGETS").grid(row=0, column=0, sticky=W)
+        ttk.Label(left, text="Scan Configuration", style="Section.TLabel").grid(row=0, column=0, columnspan=5, sticky=W, pady=(0, 10))
+        ttk.Label(left, text="Targets", style="Section.TLabel").grid(row=1, column=0, sticky=W)
         self.targets_var = tk.StringVar(value=self._default_target())
-        ttk.Entry(left, textvariable=self.targets_var).grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Entry(left, textvariable=self.targets_var).grid(row=2, column=0, sticky="ew", padx=(0, 10))
 
-        ttk.Label(left, text="SCAN PROFILE / PORTS").grid(row=0, column=1, sticky=W)
+        ttk.Label(left, text="Profile / Ports", style="Section.TLabel").grid(row=1, column=1, sticky=W)
         self.ports_var = tk.StringVar(value="deep")
         ttk.Combobox(
             left,
             textvariable=self.ports_var,
             values=["quick", "deep", "web", "windows", "databases", "20-1024", "80,443,445,3389,5985", "all"],
             width=24,
-        ).grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        ).grid(row=2, column=1, sticky="ew", padx=(0, 10))
 
-        ttk.Label(left, text="TIMEOUT").grid(row=0, column=2, sticky=W)
-        self.timeout_var = tk.DoubleVar(value=0.7)
+        ttk.Label(left, text="Timeout", style="Section.TLabel").grid(row=1, column=2, sticky=W)
+        self.timeout_var = tk.DoubleVar(value=1.1)
         ttk.Spinbox(left, from_=0.2, to=5.0, increment=0.1, textvariable=self.timeout_var, width=8).grid(
-            row=1, column=2, sticky=W, padx=(0, 8)
+            row=2, column=2, sticky=W, padx=(0, 10)
         )
 
-        ttk.Label(left, text="THREADS").grid(row=0, column=3, sticky=W)
-        self.workers_var = tk.IntVar(value=128)
+        ttk.Label(left, text="Threads", style="Section.TLabel").grid(row=1, column=3, sticky=W)
+        self.workers_var = tk.IntVar(value=96)
         ttk.Spinbox(left, from_=8, to=512, increment=8, textvariable=self.workers_var, width=8).grid(
-            row=1, column=3, sticky=W, padx=(0, 8)
+            row=2, column=3, sticky=W, padx=(0, 10)
         )
+
+        ttk.Label(left, text="Accuracy", style="Section.TLabel").grid(row=1, column=4, sticky=W)
+        self.accuracy_var = tk.StringVar(value="balanced")
+        ttk.Combobox(
+            left,
+            textvariable=self.accuracy_var,
+            values=["fast", "balanced", "precise"],
+            width=10,
+            state="readonly",
+        ).grid(row=2, column=4, sticky=W, padx=(0, 10))
 
         self.scan_dead_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="TCP discovery when ping is blocked", variable=self.scan_dead_var).grid(
-            row=2, column=0, sticky=W, pady=(8, 0)
+        ttk.Checkbutton(left, text="TCP discovery when ping is blocked", variable=self.scan_dead_var, style="Panel.TCheckbutton").grid(
+            row=3, column=0, sticky=W, pady=(12, 0)
         )
         self.banner_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="Deep banner + HTTP/TLS fingerprinting", variable=self.banner_var).grid(
-            row=2, column=1, sticky=W, pady=(8, 0)
+        ttk.Checkbutton(left, text="Service fingerprinting", variable=self.banner_var, style="Panel.TCheckbutton").grid(
+            row=3, column=1, sticky=W, pady=(12, 0)
         )
         self.udp_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="UDP-lite DNS/NTP/SNMP", variable=self.udp_var).grid(
-            row=2, column=2, sticky=W, pady=(8, 0)
+        ttk.Checkbutton(left, text="UDP-lite DNS/NTP/SNMP", variable=self.udp_var, style="Panel.TCheckbutton").grid(
+            row=3, column=2, sticky=W, pady=(12, 0)
         )
         self.trace_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Trace route", variable=self.trace_var).grid(
-            row=2, column=3, sticky=W, pady=(8, 0)
+        ttk.Checkbutton(left, text="Trace route", variable=self.trace_var, style="Panel.TCheckbutton").grid(
+            row=3, column=3, sticky=W, pady=(12, 0)
         )
         self.authorized_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(left, text="Authorized ethical assessment", variable=self.authorized_var).grid(
-            row=3, column=0, columnspan=2, sticky=W, pady=(8, 0)
+        ttk.Checkbutton(left, text="Authorized ethical assessment", variable=self.authorized_var, style="Panel.TCheckbutton").grid(
+            row=4, column=0, columnspan=2, sticky=W, pady=(8, 0)
         )
         left.columnconfigure(0, weight=3)
         left.columnconfigure(1, weight=1)
 
-        buttons = ttk.Frame(controls)
-        buttons.pack(side=RIGHT, padx=(10, 0))
-        self.start_button = ttk.Button(buttons, text="INITIATE PROBE", command=self.start_scan)
-        self.start_button.pack(fill=X)
-        self.stop_button = ttk.Button(buttons, text="ABORT", command=self.stop_scan, state="disabled")
+        buttons = ttk.Frame(controls, style="Panel.TFrame")
+        buttons.pack(side=RIGHT, padx=(14, 0), fill=Y)
+        self.start_button = ttk.Button(buttons, text="Start Scan", command=self.start_scan, style="Accent.TButton")
+        self.start_button.pack(fill=X, ipadx=10)
+        self.stop_button = ttk.Button(buttons, text="Stop", command=self.stop_scan, state="disabled", style="Danger.TButton")
         self.stop_button.pack(fill=X, pady=6)
-        ttk.Button(buttons, text="EXPORT INTEL", command=self.export_results).pack(fill=X)
+        ttk.Button(buttons, text="Export Report", command=self.export_results).pack(fill=X)
 
         self.progress = ttk.Progressbar(main, mode="determinate")
         self.progress.pack(fill=X, pady=(12, 10))
 
-        metrics = ttk.Frame(main)
+        metrics = ttk.Frame(main, style="Panel.TFrame", padding=(12, 10))
         metrics.pack(fill=X, pady=(0, 10))
-        self.hosts_metric = self._metric(metrics, "ASSETS", "0")
-        self.ports_metric = self._metric(metrics, "SERVICES", "0")
-        self.risk_metric = self._metric(metrics, "HIGH RISK", "0")
+        self.hosts_metric = self._metric(metrics, "Assets", "0")
+        self.ports_metric = self._metric(metrics, "Services", "0")
+        self.risk_metric = self._metric(metrics, "High Risk", "0")
         self.status_var = tk.StringVar(value="DeepProbe standing by")
-        ttk.Label(metrics, textvariable=self.status_var).pack(side=LEFT, padx=20)
+        ttk.Label(metrics, textvariable=self.status_var, style="PanelMuted.TLabel").pack(side=LEFT, padx=20)
 
         panes = ttk.Panedwindow(main, orient=tk.HORIZONTAL)
         panes.pack(fill=BOTH, expand=True)
 
-        table_frame = ttk.Frame(panes)
+        table_frame = ttk.Frame(panes, style="Panel.TFrame", padding=10)
         panes.add(table_frame, weight=3)
+        ttk.Label(table_frame, text="Asset Results", style="Section.TLabel").pack(anchor=W, pady=(0, 8))
 
         columns = ("ip", "hostname", "alive", "latency", "os", "ports", "score", "risk")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
@@ -1096,15 +1294,20 @@ class NetworkMapperApp(tk.Tk):
             "alive": "Alive",
             "latency": "Latency",
             "os": "OS Guess",
-            "ports": "Open Ports",
+            "ports": "Service Evidence",
             "score": "Score",
             "risk": "Risk",
         }
-        widths = {"ip": 125, "hostname": 180, "alive": 70, "latency": 90, "os": 150, "ports": 250, "score": 70, "risk": 90}
+        widths = {"ip": 130, "hostname": 190, "alive": 70, "latency": 90, "os": 165, "ports": 300, "score": 70, "risk": 90}
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor=W)
+        self.tree.tag_configure("risk_high", background="#2a1720", foreground="#fecaca")
+        self.tree.tag_configure("risk_medium", background="#292214", foreground="#fde68a")
+        self.tree.tag_configure("risk_low", background="#10251e", foreground="#bbf7d0")
         self.tree.bind("<<TreeviewSelect>>", self.show_details)
+        self.tree.bind("<Motion>", self._on_tree_motion)
+        self.tree.bind("<Leave>", self._on_tree_leave)
         scrollbar = ttk.Scrollbar(table_frame, orient=VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
@@ -1113,35 +1316,35 @@ class NetworkMapperApp(tk.Tk):
         right_pane = ttk.Panedwindow(panes, orient=tk.VERTICAL)
         panes.add(right_pane, weight=2)
 
-        graph_frame = ttk.Frame(right_pane)
-        ttk.Label(graph_frame, text="LIVE TOPOLOGY", style="SubTitle.TLabel").pack(anchor=W)
-        self.canvas = tk.Canvas(graph_frame, background="#061114", highlightthickness=1, highlightbackground="#1ddf99")
+        graph_frame = ttk.Frame(right_pane, style="Panel.TFrame", padding=10)
+        ttk.Label(graph_frame, text="Live Topology", style="Section.TLabel").pack(anchor=W, pady=(0, 8))
+        self.canvas = tk.Canvas(graph_frame, background="#0f172a", highlightthickness=1, highlightbackground="#263244")
         self.canvas.pack(fill=BOTH, expand=True, pady=(6, 0))
         right_pane.add(graph_frame, weight=2)
 
-        details_frame = ttk.Frame(right_pane)
-        ttk.Label(details_frame, text="AI INTEL PANEL", style="SubTitle.TLabel").pack(anchor=W)
-        self.details = tk.Text(details_frame, height=12, wrap="word", font=("Consolas", 10), bg="#061114", fg="#d7ffe8", insertbackground="#00ff9c")
+        details_frame = ttk.Frame(right_pane, style="Panel.TFrame", padding=10)
+        ttk.Label(details_frame, text="Intelligence Panel", style="Section.TLabel").pack(anchor=W, pady=(0, 8))
+        self.details = tk.Text(details_frame, height=12, wrap="word", font=("Consolas", 10), bg="#0f172a", fg="#e5e7eb", insertbackground="#38bdf8", relief="flat")
         self._configure_text_tags(self.details)
         self.details.pack(fill=BOTH, expand=True, pady=(6, 0))
         right_pane.add(details_frame, weight=1)
 
-        log_frame = ttk.Frame(main)
+        log_frame = ttk.Frame(main, style="Panel.TFrame", padding=10)
         log_frame.pack(fill=X, pady=(10, 0))
-        ttk.Label(log_frame, text="OPS CONSOLE").pack(anchor=W)
-        self.log = tk.Text(log_frame, height=5, wrap="word", font=("Consolas", 9), bg="#061114", fg="#00ff9c", insertbackground="#00ff9c")
+        ttk.Label(log_frame, text="Operations Console", style="Section.TLabel").pack(anchor=W, pady=(0, 8))
+        self.log = tk.Text(log_frame, height=5, wrap="word", font=("Consolas", 9), bg="#0f172a", fg="#cbd5e1", insertbackground="#38bdf8", relief="flat")
         self.log.pack(fill=X)
 
     def _configure_text_tags(self, widget):
-        widget.tag_configure("section", foreground="#00ff9c", font=("Consolas", 10, "bold"), spacing1=8)
-        widget.tag_configure("critical", foreground="#ff4d4d", font=("Consolas", 10, "bold"))
-        widget.tag_configure("high", foreground="#ff7a59", font=("Consolas", 10, "bold"))
-        widget.tag_configure("medium", foreground="#ffcf5c", font=("Consolas", 10, "bold"))
-        widget.tag_configure("low", foreground="#54f2a8")
-        widget.tag_configure("label", foreground="#8fb9a8", font=("Consolas", 10, "bold"))
-        widget.tag_configure("attack", foreground="#ffcf5c")
-        widget.tag_configure("defense", foreground="#7dd3fc")
-        widget.tag_configure("muted", foreground="#8fb9a8")
+        widget.tag_configure("section", foreground="#38bdf8", font=("Consolas", 10, "bold"), spacing1=8)
+        widget.tag_configure("critical", foreground="#f87171", font=("Consolas", 10, "bold"))
+        widget.tag_configure("high", foreground="#fb923c", font=("Consolas", 10, "bold"))
+        widget.tag_configure("medium", foreground="#facc15", font=("Consolas", 10, "bold"))
+        widget.tag_configure("low", foreground="#86efac")
+        widget.tag_configure("label", foreground="#cbd5e1", font=("Consolas", 10, "bold"))
+        widget.tag_configure("attack", foreground="#fde68a")
+        widget.tag_configure("defense", foreground="#93c5fd")
+        widget.tag_configure("muted", foreground="#94a3b8")
 
     def _render_details(self, lines):
         self.details.delete("1.0", END)
@@ -1159,15 +1362,24 @@ class NetworkMapperApp(tk.Tk):
             elif "[medium]" in lower or "medium " in lower:
                 self.details.tag_add("medium", start, end)
 
+    def _on_tree_motion(self, event):
+        if self.tree.identify_region(event.x, event.y) == "heading":
+            self.tree.configure(cursor="hand2")
+        else:
+            self.tree.configure(cursor="")
+
+    def _on_tree_leave(self, _event):
+        self.tree.configure(cursor="")
+
     def _tick_clock(self):
         self.clock_var.set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         self.after(1000, self._tick_clock)
 
     def _metric(self, parent, title, value):
-        frame = ttk.Frame(parent, padding=(0, 0, 24, 0))
+        frame = ttk.Frame(parent, style="Panel.TFrame", padding=(0, 0, 28, 0))
         frame.pack(side=LEFT)
         var = tk.StringVar(value=value)
-        ttk.Label(frame, text=title).pack(anchor=W)
+        ttk.Label(frame, text=title, style="MetricName.TLabel").pack(anchor=W)
         ttk.Label(frame, textvariable=var, style="Metric.TLabel").pack(anchor=W)
         return var
 
@@ -1203,7 +1415,10 @@ class NetworkMapperApp(tk.Tk):
         self.progress["value"] = 0
         self.status_var.set("Deep scan running...")
         self._update_metrics()
-        self._log(f"DeepProbe started with profile '{self.ports_var.get()}' across {len(ports)} TCP port(s).")
+        self._log(
+            f"DeepProbe started with profile '{self.ports_var.get()}' across {len(ports)} TCP port(s) "
+            f"in {self.accuracy_var.get()} accuracy mode."
+        )
         if self.udp_var.get():
             self._log("UDP-lite intelligence enabled for DNS/NTP/SNMP where selected.")
         if self.trace_var.get():
@@ -1230,6 +1445,7 @@ class NetworkMapperApp(tk.Tk):
                 self.udp_var.get(),
                 self.trace_var.get(),
                 self.banner_var.get(),
+                self.accuracy_var.get(),
             )
             self.events.put(("done", results))
         except ScanCancelled:
@@ -1255,7 +1471,8 @@ class NetworkMapperApp(tk.Tk):
                     self._add_host(event[1])
                 elif kind == "done":
                     self.results = event[1]
-                    self._finish_scan(f"Finished. Found {len(self.results)} host(s).")
+                    responsive = sum(1 for host in self.results if host.alive or host.ports or host.udp_findings)
+                    self._finish_scan(f"Finished. Scanned {len(self.results)} target(s); {responsive} responsive/open.")
                 elif kind == "cancelled":
                     self._finish_scan("Scan cancelled.")
                 elif kind == "error":
@@ -1276,10 +1493,18 @@ class NetworkMapperApp(tk.Tk):
         if host.udp_findings:
             udp_ports = ", ".join(f"{item.port}/u" for item in host.udp_findings)
             ports = f"{ports}, {udp_ports}" if ports else udp_ports
+        if not ports:
+            ports = "No selected ports responded"
+        tag = {
+            "High": "risk_high",
+            "Medium": "risk_medium",
+            "Low": "risk_low",
+        }.get(host.risk_label, "")
         self.tree.insert(
             "",
             END,
             iid=host.ip,
+            tags=(tag,) if tag else (),
             values=(
                 host.ip,
                 host.hostname,
@@ -1328,11 +1553,25 @@ class NetworkMapperApp(tk.Tk):
             ("", None),
             (host.intelligence, "muted"),
             ("", None),
-            ("OPEN TCP SERVICES - VULNERABILITY AND ATTACK ANALYSIS", "section"),
+            ("SCAN QUALITY AND METHOD", "section"),
         ]
+        if host.scan_notes:
+            lines.extend((f"  - {item}", "muted") for item in host.scan_notes)
+        else:
+            lines.append(("  - Standard TCP connect scan.", "muted"))
+        lines.extend([
+            ("", None),
+            ("OPEN TCP SERVICES - VULNERABILITY AND ATTACK ANALYSIS", "section"),
+        ])
         if host.ports:
             for item in host.ports:
-                lines.append((f"  {item.port}/tcp  {item.service:<14} {item.description}  [{item.severity.upper()}]", item.severity))
+                lines.append((
+                    f"  {item.port}/tcp  {item.service:<14} {item.description}  "
+                    f"[{item.severity.upper()}] confidence={item.confidence}%",
+                    item.severity,
+                ))
+                if item.connect_ms:
+                    lines.append((f"    Connect time: {item.connect_ms:.0f} ms across {item.probe_attempts} probe attempt(s)", "muted"))
                 lines.append((f"    Service purpose: {describe_service(item.port, item.service, item.description)}", "muted"))
                 if item.banner:
                     lines.append((f"    Banner: {item.banner}", "muted"))
@@ -1350,7 +1589,11 @@ class NetworkMapperApp(tk.Tk):
         lines.append(("UDP FINDINGS - INFRASTRUCTURE EXPOSURE", "section"))
         if host.udp_findings:
             for item in host.udp_findings:
-                lines.append((f"  {item.port}/udp  {item.service:<14} {item.evidence or item.description}  [{item.severity.upper()}]", item.severity))
+                lines.append((
+                    f"  {item.port}/udp  {item.service:<14} {item.evidence or item.description}  "
+                    f"[{item.severity.upper()}] confidence={item.confidence}%",
+                    item.severity,
+                ))
                 lines.append((f"    Service purpose: {describe_service(item.port, item.service, item.description)}", "muted"))
                 if item.banner:
                     lines.append((f"    Response hex: {item.banner}", "muted"))
@@ -1391,12 +1634,12 @@ class NetworkMapperApp(tk.Tk):
         center_x = width // 2
         center_y = height // 2
         for offset in range(80, min(width, height) // 2, 80):
-            self.canvas.create_oval(center_x - offset, center_y - offset, center_x + offset, center_y + offset, outline="#0d2e32")
-        self.canvas.create_oval(center_x - 52, center_y - 52, center_x + 52, center_y + 52, fill="#10262b", outline="#00ff9c", width=2)
-        self.canvas.create_text(center_x, center_y - 6, text="DEEPPROBE", fill="#00ff9c", font=("Consolas", 10, "bold"))
-        self.canvas.create_text(center_x, center_y + 12, text="CORE", fill="#8fb9a8", font=("Consolas", 8))
+            self.canvas.create_oval(center_x - offset, center_y - offset, center_x + offset, center_y + offset, outline="#1e293b")
+        self.canvas.create_oval(center_x - 52, center_y - 52, center_x + 52, center_y + 52, fill="#111827", outline="#38bdf8", width=2)
+        self.canvas.create_text(center_x, center_y - 6, text="DEEPPROBE", fill="#e5e7eb", font=("Consolas", 10, "bold"))
+        self.canvas.create_text(center_x, center_y + 12, text="CORE", fill="#94a3b8", font=("Consolas", 8))
         if not self.results:
-            self.canvas.create_text(center_x, center_y + 86, text="awaiting authorized probe", fill="#8fb9a8", font=("Consolas", 10))
+            self.canvas.create_text(center_x, center_y + 86, text="awaiting authorized scan", fill="#94a3b8", font=("Consolas", 10))
             return
 
         radius = min(width, height) * 0.36
@@ -1405,15 +1648,15 @@ class NetworkMapperApp(tk.Tk):
             angle = (2 * math.pi * index / max(count, 1)) - (math.pi / 2)
             x = center_x + radius * math.cos(angle)
             y = center_y + radius * math.sin(angle)
-            color = {"High": "#ff3b3b", "Medium": "#ffb020", "Low": "#00ff9c", "None": "#8fb9a8"}[host.risk_label]
-            self.canvas.create_line(center_x, center_y, x, y, fill="#1b4248", width=2)
-            self.canvas.create_oval(x - 31, y - 31, x + 31, y + 31, fill="#071013", outline=color, width=3)
+            color = {"High": "#f87171", "Medium": "#facc15", "Low": "#86efac", "None": "#94a3b8"}[host.risk_label]
+            self.canvas.create_line(center_x, center_y, x, y, fill="#263244", width=2)
+            self.canvas.create_oval(x - 31, y - 31, x + 31, y + 31, fill="#0b1020", outline=color, width=3)
             self.canvas.create_text(x, y - 4, text=str(len(host.ports) + len(host.udp_findings)), fill=color, font=("Consolas", 13, "bold"))
-            self.canvas.create_text(x, y + 12, text=host.risk_label.upper(), fill="#d7ffe8", font=("Consolas", 7))
+            self.canvas.create_text(x, y + 12, text=host.risk_label.upper(), fill="#e5e7eb", font=("Consolas", 7))
             label = host.hostname or host.ip
             if len(label) > 20:
                 label = label[:17] + "..."
-            self.canvas.create_text(x, y + 46, text=label, fill="#d7ffe8", font=("Consolas", 9))
+            self.canvas.create_text(x, y + 46, text=label, fill="#cbd5e1", font=("Consolas", 9))
 
     def export_results(self):
         if not self.results:
@@ -1450,6 +1693,8 @@ class NetworkMapperApp(tk.Tk):
                 "tcp_ports",
                 "udp_ports",
                 "service_descriptions",
+                "scan_evidence",
+                "confidence",
                 "weaknesses",
                 "port_attack_analysis",
                 "security_recommendations",
@@ -1476,6 +1721,14 @@ class NetworkMapperApp(tk.Tk):
                     " ".join(f"{port.port}/{port.service}" for port in host.ports),
                     " ".join(f"{port.port}/{port.service}" for port in host.udp_findings),
                     " | ".join(service_descriptions),
+                    " | ".join(
+                        f"{port.port}/{port.protocol}: {port.evidence}; connect_ms={port.connect_ms:.0f}; attempts={port.probe_attempts}"
+                        for port in host.ports + host.udp_findings
+                    ),
+                    " | ".join(
+                        f"{port.port}/{port.protocol}: {port.confidence}% {port_confidence_label(port)}"
+                        for port in host.ports + host.udp_findings
+                    ),
                     " | ".join(host.findings),
                     " | ".join(port_attack_analysis),
                     " | ".join(host.recommendations),
@@ -1486,8 +1739,16 @@ class NetworkMapperApp(tk.Tk):
         messagebox.showinfo("Export complete", f"Saved JSON, CSV, and HTML reports to:\n{export_dir}")
 
     def _build_html_report(self, data):
-        rows = []
-        for host in data:
+        total_hosts = len(data)
+        responsive_hosts = sum(1 for host in data if host["alive"] or host["ports"] or host["udp_findings"])
+        total_services = sum(len(host["ports"]) + len(host["udp_findings"]) for host in data)
+        high_risk_hosts = sum(1 for host in data if host["risk_label"] == "High")
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        risk_order = {"High": 0, "Medium": 1, "Low": 2, "None": 3}
+        sorted_hosts = sorted(data, key=lambda host: (risk_order.get(host["risk_label"], 4), -host["risk_score"], host["ip"]))
+        host_sections = []
+        for host in sorted_hosts:
             port_cards = []
             for item in host["ports"] + host["udp_findings"]:
                 profile = get_port_attack_profile(item)
@@ -1497,57 +1758,171 @@ class NetworkMapperApp(tk.Tk):
                 )
                 severity = html.escape(item["severity"].upper())
                 port_cards.append(
-                    "<div class='port-card'>"
-                    f"<div><span class='badge {html.escape(item['severity'])}'>{severity}</span> "
-                    f"<strong>{item['port']}/{html.escape(item['protocol'])}</strong> {html.escape(item['service'])}</div>"
-                    f"<div><b>Service:</b> {html.escape(describe_service(item['port'], item['service'], item['description']))}</div>"
-                    f"<div><b>Weakness:</b> {html.escape(profile['weakness'])}</div>"
-                    f"<div><b>Possible attack:</b> {html.escape(profile['attack'])}</div>"
-                    f"<div><b>Impact:</b> {html.escape(profile['impact'])}</div>"
-                    f"<div><b>Defense:</b> {html.escape(recommendation)}</div>"
+                    "<article class='service-card'>"
+                    "<div class='service-head'>"
+                    f"<span class='badge {html.escape(item['severity'])}'>{severity}</span>"
+                    f"<div><h3>{item['port']}/{html.escape(item['protocol'])} {html.escape(item['service'])}</h3>"
+                    f"<p>{html.escape(item['description'])}</p></div>"
                     "</div>"
+                    "<dl class='service-grid'>"
+                    f"<div><dt>Confidence</dt><dd>{item.get('confidence', 0)}% {html.escape(port_confidence_label(item))}</dd></div>"
+                    f"<div><dt>Connect Time</dt><dd>{float(item.get('connect_ms') or 0):.0f} ms</dd></div>"
+                    f"<div><dt>Attempts</dt><dd>{item.get('probe_attempts', 1)}</dd></div>"
+                    f"<div><dt>Evidence</dt><dd>{html.escape(item.get('evidence') or '-')}</dd></div>"
+                    "</dl>"
+                    f"<p><strong>Service purpose:</strong> {html.escape(describe_service(item['port'], item['service'], item['description']))}</p>"
+                    f"<p><strong>Weakness:</strong> {html.escape(profile['weakness'])}</p>"
+                    f"<p><strong>Possible attack:</strong> {html.escape(profile['attack'])}</p>"
+                    f"<p><strong>Impact:</strong> {html.escape(profile['impact'])}</p>"
+                    f"<p><strong>Defense:</strong> {html.escape(recommendation)}</p>"
+                    "</article>"
                 )
-            ports = "".join(port_cards) or "-"
-            findings = "<br>".join(html.escape(item) for item in host["findings"]) or "-"
-            recommendations = "<br>".join(html.escape(item) for item in host["recommendations"]) or "-"
-            rows.append(
-                "<tr>"
-                f"<td>{html.escape(host['ip'])}</td>"
-                f"<td>{html.escape(host['hostname'] or '-')}</td>"
-                f"<td>{html.escape(host['os_guess'])}</td>"
-                f"<td>{host['risk_label']} ({host['risk_score']})</td>"
-                f"<td>{ports}</td>"
-                f"<td>{findings}</td>"
-                f"<td>{recommendations}</td>"
-                "</tr>"
+            services = "".join(port_cards) or "<p class='empty'>No selected TCP or UDP services responded.</p>"
+            findings = "".join(f"<li>{html.escape(item)}</li>" for item in host["findings"]) or "<li>No weakness identified from the selected profile.</li>"
+            recommendations = "".join(f"<li>{html.escape(item)}</li>" for item in host["recommendations"]) or "<li>Validate asset ownership and patch state.</li>"
+            scan_notes = "".join(f"<li>{html.escape(item)}</li>" for item in host.get("scan_notes", [])) or "<li>Standard TCP connect scan.</li>"
+            host_sections.append(
+                "<section class='host-section'>"
+                "<div class='host-header'>"
+                "<div>"
+                f"<p class='eyebrow'>Asset</p><h2>{html.escape(host['ip'])}</h2>"
+                f"<p>{html.escape(host['hostname'] or 'No reverse DNS name')} · {html.escape(host['os_guess'])}</p>"
+                "</div>"
+                f"<div class='risk-pill {html.escape(host['risk_label'].lower())}'>{html.escape(host['risk_label'])} Risk · {host['risk_score']}/100</div>"
+                "</div>"
+                "<div class='host-meta'>"
+                f"<span>Alive: {'Yes' if host['alive'] else 'No'}</span>"
+                f"<span>Latency: {float(host['latency_ms'] or 0):.0f} ms</span>"
+                f"<span>TCP: {len(host['ports'])}</span>"
+                f"<span>UDP: {len(host['udp_findings'])}</span>"
+                "</div>"
+                f"<p class='intel'>{html.escape(host['intelligence'])}</p>"
+                "<div class='two-col'>"
+                f"<div><h3>Weaknesses</h3><ul>{findings}</ul></div>"
+                f"<div><h3>Recommendations</h3><ul>{recommendations}</ul></div>"
+                "</div>"
+                f"<details><summary>Scan Method And Evidence Notes</summary><ul>{scan_notes}</ul></details>"
+                "<h3>Detected Services</h3>"
+                f"<div class='services'>{services}</div>"
+                "</section>"
             )
         return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DeepProbe Intelligence Report</title>
   <style>
-    body {{ font-family: Consolas, Segoe UI, Arial, sans-serif; margin: 32px; color: #d7ffe8; background: #071013; }}
-    h1 {{ color: #00ff9c; letter-spacing: 2px; }}
-    table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border-bottom: 1px solid #1d3d42; padding: 10px; text-align: left; vertical-align: top; }}
-    th {{ background: #10262b; color: #00ff9c; }}
-    .port-card {{ border: 1px solid #1d3d42; background: #0b1a1d; margin: 0 0 10px; padding: 10px; border-radius: 6px; }}
-    .badge {{ display: inline-block; min-width: 72px; text-align: center; padding: 2px 6px; border-radius: 4px; color: #071013; font-weight: 700; }}
-    .critical {{ background: #ff4d4d; }}
-    .high {{ background: #ff7a59; }}
-    .medium {{ background: #ffcf5c; }}
-    .info, .low {{ background: #54f2a8; }}
-    b {{ color: #8fb9a8; }}
+    :root {{
+      color-scheme: light;
+      --bg: #f4f7fb;
+      --paper: #ffffff;
+      --ink: #111827;
+      --muted: #64748b;
+      --line: #dbe4ef;
+      --blue: #075985;
+      --blue-soft: #e0f2fe;
+      --red: #b91c1c;
+      --amber: #b45309;
+      --green: #047857;
+      --slate: #334155;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: "Segoe UI", Arial, sans-serif;
+      line-height: 1.45;
+    }}
+    .report {{
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }}
+    header {{
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 28px;
+      border-radius: 8px;
+      border: 1px solid #1e293b;
+    }}
+    h1, h2, h3, p {{ margin-top: 0; }}
+    h1 {{ margin-bottom: 8px; font-size: 30px; letter-spacing: 0; }}
+    h2 {{ margin-bottom: 4px; font-size: 22px; }}
+    h3 {{ margin-bottom: 8px; font-size: 15px; color: var(--slate); }}
+    .eyebrow {{ margin-bottom: 6px; color: #93c5fd; font-size: 12px; font-weight: 700; text-transform: uppercase; }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 16px 0;
+    }}
+    .metric, .host-section {{
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+    }}
+    .metric {{ padding: 16px; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }}
+    .metric strong {{ display: block; margin-top: 6px; font-size: 28px; }}
+    .host-section {{ margin-top: 18px; padding: 22px; }}
+    .host-header {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; border-bottom: 1px solid var(--line); padding-bottom: 14px; }}
+    .host-header p {{ color: var(--muted); margin-bottom: 0; }}
+    .host-meta {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }}
+    .host-meta span {{ background: #f1f5f9; border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px; font-size: 12px; color: var(--slate); }}
+    .risk-pill, .badge {{ border-radius: 999px; font-weight: 700; white-space: nowrap; }}
+    .risk-pill {{ padding: 8px 12px; font-size: 13px; }}
+    .risk-pill.high, .badge.high, .badge.critical {{ color: #7f1d1d; background: #fee2e2; }}
+    .risk-pill.medium, .badge.medium {{ color: #78350f; background: #fef3c7; }}
+    .risk-pill.low, .badge.low, .badge.info {{ color: #064e3b; background: #d1fae5; }}
+    .risk-pill.none {{ color: #334155; background: #e2e8f0; }}
+    .intel {{ background: var(--blue-soft); border-left: 4px solid var(--blue); padding: 12px 14px; border-radius: 6px; color: #0f172a; }}
+    .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}
+    ul {{ padding-left: 18px; }}
+    li {{ margin-bottom: 6px; }}
+    details {{ margin: 14px 0; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: #f8fafc; }}
+    summary {{ cursor: pointer; font-weight: 700; color: var(--slate); }}
+    .services {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
+    .service-card {{ border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #ffffff; }}
+    .service-head {{ display: flex; gap: 12px; align-items: flex-start; margin-bottom: 12px; }}
+    .service-head h3 {{ margin-bottom: 2px; color: var(--ink); }}
+    .service-head p {{ margin-bottom: 0; color: var(--muted); font-size: 13px; }}
+    .badge {{ display: inline-flex; min-width: 78px; justify-content: center; padding: 5px 9px; font-size: 11px; }}
+    .service-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0 0 12px; }}
+    .service-grid div {{ background: #f8fafc; border: 1px solid var(--line); border-radius: 6px; padding: 8px; }}
+    dt {{ color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }}
+    dd {{ margin: 2px 0 0; font-size: 13px; overflow-wrap: anywhere; }}
+    .empty {{ color: var(--muted); background: #f8fafc; border: 1px dashed var(--line); border-radius: 8px; padding: 14px; }}
+    footer {{ color: var(--muted); font-size: 12px; margin-top: 20px; }}
+    @media (max-width: 900px) {{
+      .summary, .two-col, .services {{ grid-template-columns: 1fr; }}
+      .host-header {{ flex-direction: column; }}
+    }}
+    @media print {{
+      body {{ background: #ffffff; }}
+      .report {{ max-width: none; padding: 0; }}
+      .host-section, .metric, header {{ box-shadow: none; break-inside: avoid; }}
+    }}
   </style>
 </head>
 <body>
-  <h1>DEEPPROBE INTELLIGENCE REPORT</h1>
-  <p>Generated {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-  <table>
-    <thead><tr><th>IP</th><th>Hostname</th><th>OS Guess</th><th>Risk</th><th>Services</th><th>Weaknesses</th><th>AI Security Recommendations</th></tr></thead>
-    <tbody>{''.join(rows)}</tbody>
-  </table>
+  <main class="report">
+    <header>
+      <p class="eyebrow">Authorized Assessment Report</p>
+      <h1>DeepProbe Network Intelligence Report</h1>
+      <p>Generated {generated_at}. Findings are based on the selected scan profile, TCP-connect validation, optional UDP probes, and local AI-style triage.</p>
+    </header>
+    <section class="summary">
+      <div class="metric"><span>Targets Scanned</span><strong>{total_hosts}</strong></div>
+      <div class="metric"><span>Responsive/Open</span><strong>{responsive_hosts}</strong></div>
+      <div class="metric"><span>Services Found</span><strong>{total_services}</strong></div>
+      <div class="metric"><span>High Risk Assets</span><strong>{high_risk_hosts}</strong></div>
+    </section>
+    {''.join(host_sections)}
+    <footer>DeepProbe reports are decision-support artifacts. Validate critical findings manually before remediation or escalation.</footer>
+  </main>
 </body>
 </html>"""
 
